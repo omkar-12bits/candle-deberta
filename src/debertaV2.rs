@@ -1,4 +1,3 @@
-
 use candle_transformers::models::with_tracing::{layer_norm, linear, LayerNorm, Linear};
 use candle_core::{ Device, IndexOp, Module, Result, Tensor, D };
 use candle_nn::{embedding, ops::softmax, Embedding, VarBuilder};
@@ -122,6 +121,67 @@ impl Module for Dropout {
     }
 }
 
+fn make_log_bucket_position(relative_pos:&Tensor, bucket_size: usize, max_position: usize)->Result<Tensor>{
+    
+    let (B,T) = relative_pos.dims2()?;
+    let flatten_pos: Vec<f32> = relative_pos.flatten_all()?.to_vec1()?;
+    let rel_pos = flatten_pos.iter().map(|elem| {if *elem>0.0{1.0}else if *elem < 0.0 {-1.0} else{0.0}}).collect::<Vec<f32>>();
+    let sign = Tensor::from_vec(rel_pos, (B,T), relative_pos.device())?;
+
+    let mid = (bucket_size /2)as f32;
+    let device = relative_pos.device();
+    let (B,T) = relative_pos.dims2()?;
+    let rlv_pos: Vec<f32> = relative_pos.flatten_all()?.to_vec1()?;
+    let mut nw_pos = vec![];
+    for elem in rlv_pos.iter(){
+        if *elem < mid  && *elem > -mid {
+            nw_pos.push(mid-1.0)
+        }
+        else {
+            nw_pos.push(elem.abs());
+        }
+    }
+    let abs_pos = Tensor::from_vec(nw_pos, (B,T), relative_pos.device())?;
+    
+    // simplifying the log pos 
+    let first_log = abs_pos.broadcast_div(&(Tensor::new(&[mid], device)?))?.log()?;             // torch.log(abs_pos / mid)
+    let second_log = Tensor::new(&[max_position as f32 - 1.0], device)?.broadcast_div(&(Tensor::new(&[mid], device)?))?.log()?; //torch.log(torch.tensor((max_position - 1) / mid))
+    let ceil_arg = first_log.broadcast_div(&second_log)?;
+    let ceil = ceil_arg.broadcast_mul(&(Tensor::new(&[mid - 1.0], relative_pos.device())?))?.ceil()?;
+    let log_pos = ceil.broadcast_add(&(Tensor::new(&[mid], device)?))?;
+
+    let i: Vec<f32> = abs_pos.flatten_all()?.to_vec1()?;
+    let j: Vec<f32> = relative_pos.flatten_all()?.to_vec1()?;
+    let k: Vec<f32> = log_pos.mul(&sign)?.flatten_all()?.to_vec1()?;
+
+    let mut bucket_pos: Vec<f32> = vec![];
+    for ((i_1,j_1),k_1) in i.iter().zip(j).zip(k){
+        if *i_1 <= mid {
+            bucket_pos.push(j_1)
+        }
+        else {
+            bucket_pos.push(k_1)
+        }
+    }
+    let bucket_pos = Tensor::from_vec(bucket_pos, (B,T), relative_pos.device())?;
+
+    Ok(bucket_pos)
+}
+
+fn build_relative_position(query_size: usize, key_size: usize, bucket_size: usize, max_position: usize, device: &Device)->Result<Tensor>{
+    let q_ids = Tensor::arange(0f32, query_size as f32, device)?;
+    let k_ids = Tensor::arange(0f32, key_size as f32, device)?;
+    let rel_pos_ids = q_ids.unsqueeze(1)?.broadcast_sub(&k_ids.unsqueeze(0)?)?;
+
+    let rel_pos_ids = make_log_bucket_position(&rel_pos_ids, bucket_size, max_position)?;
+
+    let rel_pos_ids = rel_pos_ids.to_dtype(candle_core::DType::I64)?.to_dtype(candle_core::DType::F32)?;
+    let rel_pos_ids = rel_pos_ids.i((..query_size,..))?;
+    let rel_pos_ids = rel_pos_ids.unsqueeze(0)?;
+
+    Ok(rel_pos_ids)
+}
+
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180
 pub struct DebertaV2Embeddings {
     word_embeddings: Embedding,
@@ -206,60 +266,6 @@ impl DisentangledSelfAttention {
         })
     }
 
-    
-    fn make_log_bucket_position(&self,relative_pos:&Tensor, bucket_size: usize, max_position: usize)->Result<Tensor>{
-
-    let sign  = relative_pos.to_dtype(candle_core::DType::I64)?.to_dtype(candle_core::DType::F32)?;
-    let mid = (bucket_size /2)as f32;
-    let (B,T) = relative_pos.dims2()?;
-    let rlv_pos: Vec<f32> = relative_pos.flatten_all()?.to_vec1()?;
-    let mut nw_pos = vec![];
-    for elem in rlv_pos.iter(){
-        if *elem > mid  && *elem < -mid {
-            nw_pos.push(mid-1.0)
-        }
-        else {
-            nw_pos.push(elem.abs());
-        }
-    }
-    let abs_pos = Tensor::from_vec(nw_pos, (B,T), relative_pos.device())?;
-    let log_pos = abs_pos.broadcast_sub(&Tensor::new(&[mid], relative_pos.device())?)?.log()?
-        .broadcast_sub(&Tensor::new(&[(max_position as f32 - 1.0)/mid], relative_pos.device())?
-        .mul(&Tensor::new(&[mid - 1.0], relative_pos.device())?)?)?.ceil()?.broadcast_add(&Tensor::new(&[mid], relative_pos.device())?)?;
-
-    let i: Vec<f32> = abs_pos.flatten_all()?.to_vec1()?;
-    let j: Vec<f32> = relative_pos.flatten_all()?.to_vec1()?;
-    let k: Vec<f32> = log_pos.mul(&sign)?.flatten_all()?.to_vec1()?;
-
-    let mut bucket_pos: Vec<f32> = vec![];
-    for ((i_1,j_1),k_1) in i.iter().zip(j).zip(k){
-        if *i_1 <= mid {
-            bucket_pos.push(j_1)
-        }
-        else {
-            bucket_pos.push(k_1)
-        }
-    }
-    let bucket_pos = Tensor::from_vec(bucket_pos, (B,T), relative_pos.device())?;
-
-    Ok(bucket_pos)
-}
-
-    fn build_relative_position(&self, query_size: usize, key_size: usize, bucket_size: usize, max_position: usize, device: &Device)->Result<Tensor>{
-
-        let q_ids = Tensor::arange(0f32, query_size as f32, device)?;
-        let k_ids = Tensor::arange(0f32, key_size as f32, device)?;
-        let rel_pos_ids = q_ids.unsqueeze(1)?.broadcast_sub(&k_ids.unsqueeze(0)?)?;
-
-        let rel_pos_ids = self.make_log_bucket_position(&rel_pos_ids, bucket_size, max_position)?;
-    
-        let rel_pos_ids = rel_pos_ids.to_dtype(candle_core::DType::I64)?.to_dtype(candle_core::DType::F32)?;
-        let rel_pos_ids = rel_pos_ids.i((..query_size,..))?;
-        let rel_pos_ids = rel_pos_ids.unsqueeze(0)?;
-
-        Ok(rel_pos_ids)
-    }
-
     fn transpose_for_scores(&self, xs: &Tensor) -> Result<Tensor> {
         let (B,T,_) = xs.dims3()?;
         let xs = xs.reshape((B,T,self.num_attention_heads,()))?;
@@ -277,24 +283,19 @@ impl DisentangledSelfAttention {
         Ok(normalized_softmask_values)
     }
 
-    fn disentangled_attention_bias(&self,query_layer:&Tensor, key_layer:&Tensor, rel_embeddings:&Tensor, scale_factor:&Tensor)->Result<Tensor>{
+    fn disentangled_attention_bias(&self,query_layer:&Tensor, key_layer:&Tensor, relative_pos:&Tensor, rel_embeddings:&Tensor, scale_factor:&Tensor)->Result<Tensor>{
 
         let (_,q,_) = query_layer.dims3()?;
-        let relative_pos = self.build_relative_position(q, key_layer.dim(D::Minus2)?,self.position_buckets, self.max_relative_positions, query_layer.device())?;
-
         let att_span = self.pos_ebd_size;
-        let relative_pos = relative_pos.to_dtype(candle_core::DType::I64)?.to_device(query_layer.device())?.to_dtype(candle_core::DType::F32)?;
+        let relative_pos = relative_pos.to_dtype(candle_core::DType::I64)?.to_dtype(candle_core::DType::F32)?;
 
         let rel_embeddings = rel_embeddings.i((0..att_span*2,..))?.unsqueeze(0)?;
         let (Q,_,_) = query_layer.dims3()?;
         let pos_query_layer = self.transpose_for_scores(&self.query.forward(&rel_embeddings)?)?.repeat((Q/self.num_attention_heads,1,1))?;
         let pos_key_layer = self.transpose_for_scores(&self.key.forward(&rel_embeddings)?)?.repeat((Q/self.num_attention_heads,1,1))?;
-
-        let (_,_,key_D) = pos_key_layer.dims3()?;
-        let(_,_,query_D) = pos_query_layer.dims3()?;
-
+        
         // content -> position 
-        let scale = Tensor::new(&[key_D as f32], pos_key_layer.device())?.mul(scale_factor)?.sqrt()?;
+        let scale = Tensor::new(&[pos_key_layer.dim(D::Minus1)? as f32], pos_key_layer.device())?.mul(scale_factor)?.sqrt()?;
         let c2p_att = query_layer.matmul(&pos_key_layer.transpose(D::Minus1, D::Minus2)?)?;
         let c2p_pos = relative_pos.broadcast_add(&Tensor::new(&[att_span as f32], relative_pos.device())?)?.clamp(0f32, (att_span * 2 - 1) as f32)?;
         let c2p_att = c2p_att.gather(&c2p_pos.squeeze(0)?.to_dtype(candle_core::DType::U32)?.expand((query_layer.dim(0)?,query_layer.dim(1)?, relative_pos.dim(D::Minus1)?))?.contiguous()?, D::Minus1)?;
@@ -304,11 +305,11 @@ impl DisentangledSelfAttention {
         let scale = Tensor::new(&[pos_query_layer.dim(D::Minus1)? as f32], pos_query_layer.device())?.mul(scale_factor)?.sqrt()?;
         let r_pos ;
         if key_layer.dim(D::Minus2)? != query_layer.dim(D::Minus2)?{
-            let t_pos = self.build_relative_position(key_layer.dim(D::Minus2)?,key_layer.dim(D::Minus2)?,self.position_buckets, self.max_relative_positions, query_layer.device())?;
+            let t_pos = build_relative_position(key_layer.dim(D::Minus2)?,key_layer.dim(D::Minus2)?,self.position_buckets, self.max_relative_positions, query_layer.device())?;
             r_pos = t_pos.unsqueeze(0)?;
         }
         else {
-            r_pos = relative_pos;
+            r_pos = relative_pos.clone();
         }
 
         let p2c_pos = r_pos.neg()?.broadcast_add(&Tensor::new(&[att_span as f32], r_pos.device())?)?.clamp(0 as f32, (att_span*2-1)as f32)?;
@@ -319,7 +320,7 @@ impl DisentangledSelfAttention {
         Ok(score)
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings:&Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings:&Tensor, relative_pos:&Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         // scale factor = 1 (default) + 1 (c2p) + 1 (p2c)  check -> config.pos_att_type 
         let scale_factor = Tensor::new(&[3f32],hidden_states.device())?; 
@@ -339,7 +340,9 @@ impl DisentangledSelfAttention {
         let scale = Tensor::new(&[q_l as f32 ], hidden_states.device())?.mul(&scale_factor)?.sqrt()?;
 
         let attention_scores = query_layer.matmul(&key_layer.transpose(D::Minus1, D::Minus2)?.broadcast_div(&scale)?)?;
-        let rel_embeddings = self.disentangled_attention_bias(&query_layer, &key_layer,rel_embeddings, &scale_factor)?;
+
+        let rel_embeddings = self.disentangled_attention_bias(&query_layer, &key_layer,relative_pos, rel_embeddings, &scale_factor)?;
+    
         let attention_scores = attention_scores.add(&rel_embeddings)?;
         let attention_scores = attention_scores.reshape(((),self.num_attention_heads, attention_scores.dim(D::Minus2)? as usize, attention_scores.dim(D::Minus1)? as usize))?;
         
@@ -354,7 +357,7 @@ impl DisentangledSelfAttention {
             .reshape(((),self.num_attention_heads,context_layer.dim(D::Minus2)?as usize,context_layer.dim(D::Minus1)?as usize))?
             .transpose(1, 2)?.contiguous()?;
         let context_layer = context_layer.flatten_from(D::Minus2)?;
-        
+
         Ok(context_layer)
     }
 }
@@ -409,9 +412,9 @@ impl DebertaV2Attention {
             span: tracing::span!(tracing::Level::TRACE, "attn"),
         })
     }
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings: &Tensor, relative_pos:&Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let self_outputs = self.self_attention.forward(hidden_states, attention_mask, rel_embeddings)?;
+        let self_outputs = self.self_attention.forward(hidden_states, attention_mask, rel_embeddings, relative_pos)?;
         let attention_output = self.self_output.forward(&self_outputs, hidden_states)?;
         Ok(attention_output)
     }
@@ -499,9 +502,9 @@ impl DebertaV2Layer {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor, rel_embeddings: &Tensor, relative_pos:&Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let attention_output = self.attention.forward(hidden_states, attention_mask, rel_embeddings)?;
+        let attention_output = self.attention.forward(hidden_states, attention_mask, rel_embeddings, relative_pos)?;
         // TODO: Support cross-attention?
         // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L523
         // TODO: Support something similar to `apply_chunking_to_forward`?
@@ -519,7 +522,9 @@ struct DebertaV2Encoder {
     layers: Vec<DebertaV2Layer>,
     span: tracing::Span,
     rel_embeddings: Embedding,
-    layer_norm: LayerNorm
+    layer_norm: LayerNorm,
+    position_buckets: usize,
+    max_relative_positions: usize
 }
 
 impl DebertaV2Encoder {
@@ -527,21 +532,41 @@ impl DebertaV2Encoder {
         let layers = (0..config.num_hidden_layers)
             .map(|index| DebertaV2Layer::load(vb.pp(&format!("layer.{index}")), config))
             .collect::<Result<Vec<_>>>()?;
-        let pos_ebd_size = config.position_buckets*2;
+        
+        let position_buckets = config.position_buckets;
+        let max_relative_positions = config.max_position_embeddings;
+        let pos_ebd_size = position_buckets*2;
+        
         let rel_embeddings = embedding(pos_ebd_size, config.hidden_size, vb.pp("rel_embeddings"))?;
         let layer_norm = layer_norm(config.hidden_size, config.layer_norm_eps, vb.pp("LayerNorm"))?;
         let span = tracing::span!(tracing::Level::TRACE, "encoder");
-        Ok(DebertaV2Encoder { layers, span , rel_embeddings,layer_norm})
+        
+        Ok(DebertaV2Encoder { layers, span , rel_embeddings,layer_norm , position_buckets, max_relative_positions})
+    }
+
+    fn get_rel_pos(&self,hidden_states: &Tensor)->Result<Tensor>{
+        let q = hidden_states.dim(D::Minus2)?;
+        // println!("{} {} {} {}",q , hidden_states.dim(D::Minus2)?, self.position_buckets, self.max_relative_positions);
+        let relative_pos = build_relative_position(
+            q, 
+            hidden_states.dim(D::Minus2)?, 
+            self.position_buckets, 
+            self.max_relative_positions, 
+            hidden_states.device()
+        )?;
+        println!("relative pos {}",relative_pos);
+        Ok(relative_pos)
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-
+        println!("{:?}",hidden_states.shape());
+        let relative_pos = self.get_rel_pos(hidden_states)?;
         let mut hidden_states = hidden_states.clone();
         let rel_embeddings = self.layer_norm.forward(self.rel_embeddings.embeddings())?;
         // Use a loop rather than a fold as it's easier to modify when adding debug/...
         for layer in self.layers.iter() {
-            hidden_states = layer.forward(&hidden_states, attention_mask, &rel_embeddings)?
+            hidden_states = layer.forward(&hidden_states, attention_mask, &rel_embeddings, &relative_pos)?
         }
         Ok(hidden_states)
     }
