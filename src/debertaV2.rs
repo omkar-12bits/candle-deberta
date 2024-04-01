@@ -27,7 +27,6 @@ impl HiddenActLayer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
-            // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
             HiddenAct::Gelu => xs.gelu_erf(),
             HiddenAct::GeluApproximate => xs.gelu(),
             HiddenAct::Relu => xs.relu(),
@@ -42,7 +41,6 @@ enum PositionEmbeddingType {
     Absolute,
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/configuration_bert.py#L1
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     vocab_size: usize,
@@ -66,8 +64,6 @@ pub struct Config {
     #[serde(default)]
     pad_token_id: usize,
     #[serde(default)]
-    position_embedding_type: PositionEmbeddingType,
-    #[serde(default)]
     use_cache: bool,
     classifier_dropout: Option<f64>,
     model_type: Option<String>,
@@ -88,7 +84,6 @@ impl Default for Config {
             initializer_range: 0.02,
             layer_norm_eps: 1e-7,
             pad_token_id: 0,
-            position_embedding_type: PositionEmbeddingType::Absolute,
             use_cache: true,
             classifier_dropout: None,
             model_type: Some("deberta".to_string()),
@@ -182,7 +177,7 @@ fn build_relative_position(query_size: usize, key_size: usize, bucket_size: usiz
     Ok(rel_pos_ids)
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180
+
 pub struct DebertaV2Embeddings {
     word_embeddings: Embedding,
     layer_norm: LayerNorm,
@@ -227,7 +222,6 @@ struct DisentangledSelfAttention {
     value: Linear,
     dropout: Dropout,
     num_attention_heads: usize,
-    attention_head_size: usize,
     span: tracing::Span,
     span_softmax: tracing::Span,
     pos_ebd_size : usize,
@@ -257,7 +251,6 @@ impl DisentangledSelfAttention {
             value,
             dropout,
             num_attention_heads: config.num_attention_heads,
-            attention_head_size,
             pos_ebd_size,
             position_buckets,
             max_relative_positions,
@@ -285,12 +278,11 @@ impl DisentangledSelfAttention {
 
     fn disentangled_attention_bias(&self,query_layer:&Tensor, key_layer:&Tensor, relative_pos:&Tensor, rel_embeddings:&Tensor, scale_factor:&Tensor)->Result<Tensor>{
 
-        let (_,q,_) = query_layer.dims3()?;
         let att_span = self.pos_ebd_size;
         let relative_pos = relative_pos.to_dtype(candle_core::DType::I64)?.to_dtype(candle_core::DType::F32)?;
 
         let rel_embeddings = rel_embeddings.i((0..att_span*2,..))?.unsqueeze(0)?;
-        let (Q,_,_) = query_layer.dims3()?;
+        let Q = query_layer.dim(0)?;
         let pos_query_layer = self.transpose_for_scores(&self.query.forward(&rel_embeddings)?)?.repeat((Q/self.num_attention_heads,1,1))?;
         let pos_key_layer = self.transpose_for_scores(&self.key.forward(&rel_embeddings)?)?.repeat((Q/self.num_attention_heads,1,1))?;
         
@@ -325,7 +317,7 @@ impl DisentangledSelfAttention {
         // scale factor = 1 (default) + 1 (c2p) + 1 (p2c)  check -> config.pos_att_type 
         let scale_factor = Tensor::new(&[3f32],hidden_states.device())?; 
 
-        let query_layer = self.query.forward(hidden_states)?;
+        let query_layer = self.query.forward(hidden_states)?; // time should reduce after first layer forward pass to match python speed 
         let key_layer = self.key.forward(hidden_states)?;
         let value_layer = self.value.forward(hidden_states)?;
 
@@ -333,17 +325,14 @@ impl DisentangledSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer)?;
         let value_layer = self.transpose_for_scores(&value_layer)?;
 
-        // let attention_scores = query_layer.matmul(&key_layer.t()?)?;
-        // let attention_scores = (attention_scores / (self.attention_head_size as f64).sqrt())?;
-
         let q_l = query_layer.dim(D::Minus1)?;
         let scale = Tensor::new(&[q_l as f32 ], hidden_states.device())?.mul(&scale_factor)?.sqrt()?;
 
         let attention_scores = query_layer.matmul(&key_layer.transpose(D::Minus1, D::Minus2)?.broadcast_div(&scale)?)?;
 
-        let rel_embeddings = self.disentangled_attention_bias(&query_layer, &key_layer,relative_pos, rel_embeddings, &scale_factor)?;
+        let rel_att = self.disentangled_attention_bias(&query_layer, &key_layer,relative_pos, rel_embeddings, &scale_factor)?;
     
-        let attention_scores = attention_scores.add(&rel_embeddings)?;
+        let attention_scores = attention_scores.add(&rel_att)?;
         let attention_scores = attention_scores.reshape(((),self.num_attention_heads, attention_scores.dim(D::Minus2)? as usize, attention_scores.dim(D::Minus1)? as usize))?;
         
         let attention_probs = {
@@ -395,7 +384,7 @@ impl DebertaV2SelfOutput {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L392
+
 struct DebertaV2Attention {
     self_attention: DisentangledSelfAttention,
     self_output: DebertaV2SelfOutput,
@@ -421,7 +410,6 @@ impl DebertaV2Attention {
 }
 
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L441
 struct DebertaV2Intermediate {
     dense: Linear,
     intermediate_act: HiddenActLayer,
@@ -448,7 +436,7 @@ impl Module for DebertaV2Intermediate {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L456
+
 struct DebertaV2Output {
     dense: Linear,
     layer_norm: LayerNorm,
@@ -481,7 +469,7 @@ impl DebertaV2Output {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L470
+
 struct DebertaV2Layer {
     attention: DebertaV2Attention,
     intermediate: DebertaV2Intermediate,
@@ -506,7 +494,7 @@ impl DebertaV2Layer {
         let _enter = self.span.enter();
         let attention_output = self.attention.forward(hidden_states, attention_mask, rel_embeddings, relative_pos)?;
         // TODO: Support cross-attention?
-        // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L523
+
         // TODO: Support something similar to `apply_chunking_to_forward`?
         let intermediate_output = self.intermediate.forward(&attention_output)?;
         let layer_output = self
@@ -517,7 +505,7 @@ impl DebertaV2Layer {
 }
 
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L556
+
 struct DebertaV2Encoder {
     layers: Vec<DebertaV2Layer>,
     span: tracing::Span,
@@ -546,7 +534,6 @@ impl DebertaV2Encoder {
 
     fn get_rel_pos(&self,hidden_states: &Tensor)->Result<Tensor>{
         let q = hidden_states.dim(D::Minus2)?;
-        // println!("{} {} {} {}",q , hidden_states.dim(D::Minus2)?, self.position_buckets, self.max_relative_positions);
         let relative_pos = build_relative_position(
             q, 
             hidden_states.dim(D::Minus2)?, 
@@ -554,13 +541,11 @@ impl DebertaV2Encoder {
             self.max_relative_positions, 
             hidden_states.device()
         )?;
-        println!("relative pos {}",relative_pos);
         Ok(relative_pos)
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        println!("{:?}",hidden_states.shape());
         let relative_pos = self.get_rel_pos(hidden_states)?;
         let mut hidden_states = hidden_states.clone();
         let rel_embeddings = self.layer_norm.forward(self.rel_embeddings.embeddings())?;
@@ -572,7 +557,7 @@ impl DebertaV2Encoder {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L874
+
 pub struct DebertaV2Model {
     embeddings: DebertaV2Embeddings,
     encoder: DebertaV2Encoder,
