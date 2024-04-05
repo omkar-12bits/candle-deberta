@@ -1,5 +1,5 @@
 [package]
-name = "DebertaV2Model"
+name = "deberta_v2"
 version = "0.1.0"
 edition = "2021"
 
