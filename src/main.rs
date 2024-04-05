@@ -1,4 +1,4 @@
-mod debertaV2;
+mod deberta_v2;
 
 
 use anyhow::{Error as E,Ok,Result};
@@ -7,7 +7,7 @@ use candle_nn::VarBuilder;
 use clap::Parser;
 use tokenizers::{PaddingParams, Tokenizer};
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use debertaV2::{Config,DebertaV2Model};
+use deberta_v2::{Config,DebertaV2Model};
 
 #[derive(Parser, Debug)]
 struct Args{
@@ -87,7 +87,7 @@ impl Args {
         else{
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights], candle_core::DType::F32, &device)? }
         };
-        let model = debertaV2::DebertaV2Model::load(vb.clone(), &config)?;
+        let model = deberta_v2::DebertaV2Model::load(vb.clone(), &config)?;
     
         let mut tokenizer = Tokenizer::from_file("tokenizer.json").map_err(E::msg)?;
         let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
