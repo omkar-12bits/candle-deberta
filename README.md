@@ -16,11 +16,9 @@ cargo run --release -- --prompt "isn't the moon lovely"
 
 #### ToDo ! 
 
-- Remove all vector operations and make backward compatibile to finetune.
 - Optimize Attention block.
 
 #### Things to Consider 
 
 - Bottleneck in the Attention block.
-- Finetune/Training is not possible until the attention block operations are implemented using Tensor operations. 
 - Sentence similarity scores are way off.
