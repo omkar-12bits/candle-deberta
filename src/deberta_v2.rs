@@ -118,7 +118,7 @@ impl Module for Dropout {
 
 fn make_log_bucket_position(relative_pos:&Tensor, bucket_size: usize, max_position: usize)->Result<Tensor>{
     let device = relative_pos.device();
-    // thanks to @tomsanbear for this operation
+
     let sign = relative_pos.sign()?; 
     let mid = (bucket_size /2)as f32;
     
